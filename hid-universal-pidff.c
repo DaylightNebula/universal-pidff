@@ -104,14 +104,28 @@ static int universal_pidff_probe(struct hid_device *hdev,
 	error = init_function(hdev, id->driver_data);
 	if (error) {
 		hid_warn(hdev, "Error initialising force feedback\n");
-		goto err;
+		goto err_stop;
 	}
 
 	hid_info(hdev, "Universal pidff driver loaded successfully!");
 
 	return 0;
+err_stop:
+	hid_hw_stop(hdev);
 err:
 	return error;
+}
+
+/*
+ * We define .remove, so hid-core no longer calls hid_hw_stop() for us.
+ * The watchdog work must be cancelled before the hid_device is freed:
+ * ff->destroy() alone is not enough, an open evdev fd can defer it
+ * arbitrarily past this point.
+ */
+static void universal_pidff_remove(struct hid_device *hdev)
+{
+	hid_pidff_stop_watchdog(hdev);
+	hid_hw_stop(hdev);
 }
 
 static int universal_pidff_input_configured(struct hid_device *hdev,
@@ -199,6 +213,7 @@ static struct hid_driver universal_pidff = {
 	.id_table = universal_pidff_devices,
 	.input_mapping = universal_pidff_input_mapping,
 	.probe = universal_pidff_probe,
+	.remove = universal_pidff_remove,
 	.input_configured = universal_pidff_input_configured
 };
 module_hid_driver(universal_pidff);

@@ -1,0 +1,51 @@
+00000000 # Run with: ffbplay -d /dev/input/by-id/usb-<wheelbase-id> ./watchdog-test.ffb
+00000000 # Watch `sudo dmesg -w` alongside. Default watchdog_timeout_ms is 500.
+00000000 #
+00000000 # Counters, readable without root:
+00000000 #   grep . /sys/module/hid_universal_pidff/parameters/watchdog_*
+00000000 # A full pass should add:
+00000000 #   arms=3 runs=2 stops=2 resumes=1 defers=0 idle=0
+00000000 #
+00000000 # The watchdog measures time since the commanded force last CHANGED,
+00000000 # not time since the last ioctl. Games stream FFB continuously and keep
+00000000 # doing so while paused (Dirt Rally sends ~500 PLAY/s either way), so
+00000000 # "userspace went quiet" never happens and cannot be the signal.
+00000000 # Redundant PLAYs and re-uploads of an unchanged magnitude are dropped
+00000000 # before they reach the watchdog.
+
+00000000 # Constant force left - simulates a game applying steady torque
+00000000 > UPLOAD id:-1 dir:16384 type:CONSTANT level:8000
+00000000 < 0 id:0
+00000000 > PLAY 0 1
+
+00000000 # Now hold that force unchanged for 5s, i.e. a paused game.
+00000000 # Expect: at ~0.5s the watchdog fires (dmesg shows
+00000000 # "watchdog: no FFB activity for 500 ms, muting force feedback")
+00000000 # and the wheel goes slack on its own.
+00000000 #
+00000000 # Mute sends BOTH device gain -> 0 and PID_STOP_ALL_EFFECTS, because
+00000000 # bases disagree about which they honour. Un-mute sends
+00000000 # PID_ENABLE_ACTUATORS first: the base parks itself once everything
+00000000 # stops and a bare EFFECT_START will not wake it, which is why
+00000000 # pidff_reset() has always paired those two commands.
+
+02500000 # A redundant PLAY must NOT count as activity. If this un-mutes the
+02500000 # wheel, the driver is back to being fooled by a paused game.
+02500000 # Expect: no change, and defers stays 0.
+02500000 > PLAY 0 1
+
+05000000 # Unpause: the magnitude actually changes. THIS is what resumes force.
+05000000 # Expect: wheel loads up again within a frame, resumes=1.
+05000000 > UPLOAD id:0 dir:16384 type:CONSTANT level:12000
+
+05500000 # Held unchanged again -> expect a second mute at ~5.5s.
+
+07500000 > STOP 0
+07500000 > REMOVE 0
+
+07500000 # Negative check: with the effect erased, idling past the timeout must
+07500000 # NOT mute again - pidff_erase_effect() clears loop_count, so
+07500000 # pidff_any_effect_playing() is false and the handler bails.
+07500000 # stops must stay at 2; idle may increment.
+
+11000000 # Test end

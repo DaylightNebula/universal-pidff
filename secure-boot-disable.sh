@@ -1,0 +1,1 @@
+sudo rmmod -f hid_universal_pidff

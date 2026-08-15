@@ -67,4 +67,7 @@
 int hid_pidff_init(struct hid_device *hid);
 int hid_pidff_init_with_quirks(struct hid_device *hid, u32 initial_quirks);
 
+/* Must run before hid_hw_stop(). Safe on devices that never ran init. */
+void hid_pidff_stop_watchdog(struct hid_device *hid);
+
 #endif

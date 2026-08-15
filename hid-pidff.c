@@ -11,14 +11,63 @@
 #include "hid-pidff.h"
 #include <linux/hid.h>
 #include <linux/input.h>
+#include <linux/jiffies.h>
 #include <linux/math64.h>
 #include <linux/minmax.h>
+#include <linux/moduleparam.h>
 #include <linux/slab.h>
 #include <linux/stringify.h>
 #include <linux/usb.h>
+#include <linux/workqueue.h>
 
 #define	PID_EFFECTS_MAX		64
 #define	PID_INFINITE		U16_MAX
+
+/*
+ * A paused game stops streaming FFB updates but never sends STOP, leaving an
+ * infinite effect running on the device at its last magnitude. Cut force after
+ * this long without any FFB activity. 0 disables the watchdog entirely.
+ */
+#define PIDFF_WATCHDOG_MIN_MS	100
+static unsigned int watchdog_timeout_ms = 100;//500;
+module_param(watchdog_timeout_ms, uint, 0644);
+MODULE_PARM_DESC(watchdog_timeout_ms,
+	"Mute force feedback after this many ms without FFB activity (0 = disabled)");
+
+/*
+ * Diagnostics, readable without root at
+ * /sys/module/hid_universal_pidff/parameters/. dmesg_restrict=1 is common, so
+ * these are the only way to tell "never armed" from "armed but never fired"
+ * from "fired but the device ignored it".
+ * ponytail: module-global rather than per-device; fine while these boxes have
+ * one wheel, make them per-device sysfs attrs if that stops being true.
+ */
+static unsigned int watchdog_arms;
+module_param(watchdog_arms, uint, 0444);
+MODULE_PARM_DESC(watchdog_arms, "Times the watchdog was armed (read-only)");
+
+static unsigned int watchdog_runs;
+module_param(watchdog_runs, uint, 0444);
+MODULE_PARM_DESC(watchdog_runs, "Times the watchdog handler ran (read-only)");
+
+static unsigned int watchdog_stops;
+module_param(watchdog_stops, uint, 0444);
+MODULE_PARM_DESC(watchdog_stops, "Times the watchdog muted force (read-only)");
+
+static unsigned int watchdog_resumes;
+module_param(watchdog_resumes, uint, 0444);
+MODULE_PARM_DESC(watchdog_resumes, "Times the watchdog un-muted force (read-only)");
+
+static unsigned int watchdog_defers;
+module_param(watchdog_defers, uint, 0444);
+MODULE_PARM_DESC(watchdog_defers, "Handler ran but force had changed since (read-only)");
+
+static unsigned int watchdog_idle;
+module_param(watchdog_idle, uint, 0444);
+MODULE_PARM_DESC(watchdog_idle, "Handler ran but no effect was playing (read-only)");
+
+/* pidff_device.flags */
+#define PIDFF_WATCHDOG_STOPPED	0
 
 /* Linux Force Feedback API uses miliseconds as time unit */
 #define FF_TIME_EXPONENT	-3
@@ -243,6 +292,14 @@ struct pidff_device {
 	u32 quirks;
 	u8 effect_count;
 	u8 axis_count;
+
+	/* Idle watchdog. See watchdog_timeout_ms. */
+	struct delayed_work watchdog;
+	struct work_struct resume_work;	/* un-mute needs to sleep, see below */
+	struct mutex report_lock;	/* between the two work items only */
+	unsigned long last_activity;	/* jiffies */
+	unsigned long flags;		/* PIDFF_WATCHDOG_* */
+	u16 gain;			/* last gain userspace asked for */
 };
 
 static int pidff_is_effect_conditional(struct ff_effect *effect)
@@ -746,6 +803,129 @@ static void pidff_set_device_control(struct pidff_device *pidff, int field)
 }
 
 /*
+ * Effective watchdog timeout. The parameter is writable at runtime, so clamp
+ * it here rather than trusting the stored value; a timeout of a few ms would
+ * make the device unusable.
+ */
+static unsigned int pidff_watchdog_ms(void)
+{
+	unsigned int ms = READ_ONCE(watchdog_timeout_ms);
+
+	return ms ? max(ms, (unsigned int)PIDFF_WATCHDOG_MIN_MS) : 0;
+}
+
+/*
+ * Note the device is being talked to, and arm the watchdog if an effect was
+ * just started. Called from atomic context.
+ *
+ * Deliberately NOT gated on effect[].is_infinite: that is whatever userspace
+ * put in replay.length, and a game or test tool that uploads a long-but-finite
+ * effect would silently opt itself out of the safety net. Stopping an effect
+ * that already expired on its own is harmless.
+ */
+static void pidff_watchdog_kick(struct pidff_device *pidff, bool arm)
+{
+	unsigned int ms = pidff_watchdog_ms();
+
+	WRITE_ONCE(pidff->last_activity, jiffies);
+
+	/* No-op when already pending, so this stays cheap on the update path */
+	if (arm && ms) {
+		watchdog_arms++;
+		schedule_delayed_work(&pidff->watchdog, msecs_to_jiffies(ms));
+	}
+}
+
+static bool pidff_any_effect_playing(struct pidff_device *pidff)
+{
+	for (int i = 0; i < PID_EFFECTS_MAX; i++)
+		if (READ_ONCE(pidff->effect[i].loop_count))
+			return true;
+
+	return false;
+}
+
+static void pidff_watchdog(struct work_struct *work)
+{
+	struct pidff_device *pidff =
+		container_of(to_delayed_work(work), struct pidff_device, watchdog);
+	unsigned int ms = pidff_watchdog_ms();
+	unsigned long deadline;
+
+	if (!ms)
+		return;
+
+	watchdog_runs++;
+
+	/* Activity landed while we were queued - push the deadline out */
+	deadline = READ_ONCE(pidff->last_activity) + msecs_to_jiffies(ms);
+	if (time_before(jiffies, deadline)) {
+		watchdog_defers++;
+		schedule_delayed_work(&pidff->watchdog, deadline - jiffies);
+		return;
+	}
+
+	if (!pidff_any_effect_playing(pidff)) {
+		watchdog_idle++;
+		return;
+	}
+
+	/*
+	 * Flag first: the reverse order would let a concurrent pidff_playback()
+	 * un-mute and then have us mute it right afterwards.
+	 */
+	set_bit(PIDFF_WATCHDOG_STOPPED, &pidff->flags);
+	watchdog_stops++;
+
+	mutex_lock(&pidff->report_lock);
+	/*
+	 * Both levers, because bases disagree about which one they honour.
+	 * A Moza demonstrably goes slack on STOP_ALL_EFFECTS; whether it also
+	 * respects a zero device gain is not something the descriptor tells us.
+	 * Sending both costs two reports on an idle device and means we do not
+	 * need a per-model quirk to guess right.
+	 */
+	pidff_set_gain_report(pidff, 0);
+	pidff_set_device_control(pidff, PID_STOP_ALL_EFFECTS);
+	mutex_unlock(&pidff->report_lock);
+
+	hid_info(pidff->hid,
+		 "watchdog: no FFB activity for %u ms, muting force feedback\n", ms);
+}
+
+/*
+ * The sleeping half of un-muting. PID_ENABLE_ACTUATORS matters because
+ * pidff_reset() has always had to re-enable actuators right after sending
+ * STOP_ALL_EFFECTS - the base parks itself when everything stops, and a bare
+ * EFFECT_START will not wake it. pidff_set_device_control() calls
+ * hid_hw_wait(), so this cannot live on the ff->playback path.
+ */
+static void pidff_playback_pid(struct pidff_device *pidff, int pid_id, int n);
+
+static void pidff_resume_work(struct work_struct *work)
+{
+	struct pidff_device *pidff =
+		container_of(work, struct pidff_device, resume_work);
+
+	mutex_lock(&pidff->report_lock);
+
+	/* Re-muted while we were queued - leave it muted */
+	if (test_bit(PIDFF_WATCHDOG_STOPPED, &pidff->flags))
+		goto out;
+
+	pidff_set_device_control(pidff, PID_ENABLE_ACTUATORS);
+	pidff_set_gain_report(pidff, pidff->gain);
+
+	/* STOP_ALL_EFFECTS stopped these; the blocks are still loaded */
+	for (int i = 0; i < PID_EFFECTS_MAX; i++)
+		if (READ_ONCE(pidff->effect[i].loop_count))
+			pidff_playback_pid(pidff, pidff->effect[i].pid_id,
+					   READ_ONCE(pidff->effect[i].loop_count));
+out:
+	mutex_unlock(&pidff->report_lock);
+}
+
+/*
  * Reset the device, stop all effects, enable actuators
  */
 static void pidff_reset(struct pidff_device *pidff)
@@ -861,14 +1041,56 @@ static void pidff_playback_pid(struct pidff_device *pidff, int pid_id, int n)
 }
 
 /*
+ * Undo the watchdog mute. Reachable from both atomic (playback) and process
+ * (upload) context, so it must only ever hid_hw_request() - no hid_hw_wait(),
+ * no sleeping locks. test_and_clear_bit() makes sure only one caller restores.
+ */
+static void pidff_watchdog_resume(struct pidff_device *pidff)
+{
+	if (!test_and_clear_bit(PIDFF_WATCHDOG_STOPPED, &pidff->flags))
+		return;
+
+	hid_dbg(pidff->hid, "watchdog: FFB activity resumed, un-muting\n");
+	watchdog_resumes++;
+
+	/* Cheap part inline; the rest needs to sleep, so hand it to a worker */
+	pidff_set_gain_report(pidff, pidff->gain);
+	schedule_work(&pidff->resume_work);
+
+	/*
+	 * Force is live again, so guard it again. The handler deliberately does
+	 * not re-arm itself after firing (that would re-mute every timeout while
+	 * paused), which makes this the only thing that re-arms after a mute.
+	 * Without it a game that resumes by streaming uploads alone, never
+	 * re-sending PLAY, would leave the wheel unguarded for the session.
+	 */
+	pidff_watchdog_kick(pidff, true);
+}
+
+/*
  * Play the effect with effect id @effect_id for @value times
  */
 static int pidff_playback(struct input_dev *dev, int effect_id, int value)
 {
 	struct pidff_device *pidff = dev->ff->private;
 
+	/*
+	 * A redundant PLAY carries no new information - Dirt Rally streams
+	 * ~500/s and keeps doing so while paused, which is precisely the state
+	 * we need to detect. Bail before touching the watchdog so those do not
+	 * count as the wheel being actively driven.
+	 */
 	if (!pidff_needs_playback(pidff, effect_id, value))
 		return 0;
+
+	/*
+	 * Skipped for a stop request: restoring force just to drop it again
+	 * would be a torque spike delivered by the safety feature itself.
+	 */
+	if (value)
+		pidff_watchdog_resume(pidff);
+
+	pidff_watchdog_kick(pidff, value);
 
 	hid_dbg(pidff->hid, "requesting %s on FF effect %d",
 		value == 0 ? "stop" : "playback", effect_id);
@@ -907,6 +1129,14 @@ static int pidff_erase_effect(struct input_dev *dev, int effect_id)
 	pidff_playback_pid(pidff, pid_id, 0);
 	pidff_erase_pid(pidff, pid_id);
 
+	/*
+	 * This bypasses pidff_playback(), so clear the cached state by hand.
+	 * Otherwise the slot keeps is_infinite/loop_count forever and anything
+	 * scanning pidff->effect[] acts on a freed PID block.
+	 */
+	pidff->effect[effect_id].loop_count = 0;
+	pidff->effect[effect_id].is_infinite = 0;
+
 	if (pidff->effect_count > 0)
 		pidff->effect_count--;
 
@@ -914,14 +1144,16 @@ static int pidff_erase_effect(struct input_dev *dev, int effect_id)
 	return 0;
 }
 
+/* Both set @changed, which the caller uses as its "force actually moved" signal */
 #define PIDFF_SET_REPORT_IF_NEEDED(type, effect, old) \
-	({ if (!old || pidff_needs_set_## type(effect, old)) \
-		pidff_set_ ##type## _report(pidff, effect); })
+	({ if (!old || pidff_needs_set_## type(effect, old)) { \
+		pidff_set_ ##type## _report(pidff, effect); changed = true; } })
 
 #define PIDFF_SET_ENVELOPE_IF_NEEDED(type, effect, old) \
 	({ if (pidff_needs_set_envelope(&effect->u.type.envelope, \
-	       old ? &old->u.type.envelope : NULL)) \
-		pidff_set_envelope_report(pidff, &effect->u.type.envelope); })
+	       old ? &old->u.type.envelope : NULL)) { \
+		pidff_set_envelope_report(pidff, &effect->u.type.envelope); \
+		changed = true; } })
 
 /*
  * Effect upload handler
@@ -931,6 +1163,7 @@ static int pidff_upload_effect(struct input_dev *dev, struct ff_effect *new,
 {
 	struct pidff_device *pidff = dev->ff->private;
 	const int type_id = pidff_get_effect_type_id(pidff, new);
+	bool changed = false;
 
 	if (!type_id) {
 		hid_err(pidff->hid, "effect type not supported\n");
@@ -983,6 +1216,17 @@ static int pidff_upload_effect(struct input_dev *dev, struct ff_effect *new,
 		PIDFF_SET_REPORT_IF_NEEDED(condition, new, old);
 		break;
 	}
+
+	/*
+	 * Only a parameter that actually moved counts. A paused game that keeps
+	 * re-uploading the same magnitude every frame (Dirt Rally does exactly
+	 * this) sends no reports here, so it correctly reads as idle.
+	 */
+	if (changed) {
+		pidff_watchdog_resume(pidff);
+		pidff_watchdog_kick(pidff, pidff_any_effect_playing(pidff));
+	}
+
 	hid_dbg(pidff->hid, "uploaded\n");
 	return 0;
 }
@@ -992,7 +1236,16 @@ static int pidff_upload_effect(struct input_dev *dev, struct ff_effect *new,
  */
 static void pidff_set_gain(struct input_dev *dev, u16 gain)
 {
-	pidff_set_gain_report(dev->ff->private, gain);
+	struct pidff_device *pidff = dev->ff->private;
+
+	/* Remembered so the watchdog knows what to restore after muting */
+	pidff->gain = gain;
+
+	/* Stay muted while idle; pidff_watchdog_resume() applies this value */
+	if (test_bit(PIDFF_WATCHDOG_STOPPED, &pidff->flags))
+		return;
+
+	pidff_set_gain_report(pidff, gain);
 }
 
 static void pidff_autocenter(struct pidff_device *pidff, u16 magnitude)
@@ -1030,6 +1283,36 @@ static void pidff_autocenter(struct pidff_device *pidff, u16 magnitude)
 static void pidff_set_autocenter(struct input_dev *dev, u16 magnitude)
 {
 	pidff_autocenter(dev->ff->private, magnitude);
+}
+
+/*
+ * ff->destroy() handler
+ *
+ * ff->private (our pidff) is freed by the input core, so do NOT kfree it here.
+ * This runs from input_dev_release(), which an open evdev fd can defer well
+ * past hid_hw_stop() - hid-universal-pidff's .remove() is what actually stops
+ * the watchdog in time. This is the belt-and-braces half.
+ */
+static void pidff_destroy(struct ff_device *ff)
+{
+	struct pidff_device *pidff = ff->private;
+
+	cancel_delayed_work_sync(&pidff->watchdog);
+	cancel_work_sync(&pidff->resume_work);
+}
+
+/*
+ * Stop the watchdog before the hid_device goes away. Safe to call for a
+ * device that never ran hid_pidff_init() - drvdata is then NULL.
+ */
+void hid_pidff_stop_watchdog(struct hid_device *hid)
+{
+	struct pidff_device *pidff = hid_get_drvdata(hid);
+
+	if (pidff) {
+		cancel_delayed_work_sync(&pidff->watchdog);
+		cancel_work_sync(&pidff->resume_work);
+	}
 }
 
 /*
@@ -1562,6 +1845,12 @@ int hid_pidff_init_with_quirks(struct hid_device *hid, u32 initial_quirks)
 	pidff->quirks = initial_quirks;
 	pidff->effect_count = 0;
 
+	mutex_init(&pidff->report_lock);
+	INIT_DELAYED_WORK(&pidff->watchdog, pidff_watchdog);
+	INIT_WORK(&pidff->resume_work, pidff_resume_work);
+	pidff->last_activity = jiffies;
+	hid_set_drvdata(hid, pidff);
+
 	hid_device_io_start(hid);
 
 	pidff_find_reports(hid, HID_OUTPUT_REPORT, pidff);
@@ -1579,6 +1868,7 @@ int hid_pidff_init_with_quirks(struct hid_device *hid, u32 initial_quirks)
 
 	/* pool report is sometimes messed up, refetch it */
 	pidff_fetch_pool(pidff);
+	pidff->gain = U16_MAX;
 	pidff_set_gain_report(pidff, U16_MAX);
 	error = pidff_check_autocenter(pidff, dev);
 	if (error)
@@ -1620,6 +1910,7 @@ int hid_pidff_init_with_quirks(struct hid_device *hid, u32 initial_quirks)
 	ff->set_gain = pidff_set_gain;
 	ff->set_autocenter = pidff_set_autocenter;
 	ff->playback = pidff_playback;
+	ff->destroy = pidff_destroy;
 
 	hid_info(dev, "Force feedback for USB HID PID devices by Anssi Hannula\n");
 	hid_dbg(dev, "Active quirks mask: 0x%08x\n", pidff->quirks);
@@ -1631,6 +1922,10 @@ int hid_pidff_init_with_quirks(struct hid_device *hid, u32 initial_quirks)
 fail:
 	hid_device_io_stop(hid);
 
+	/* Nothing arms the watchdog before this point, but don't leave a
+	 * dangling drvdata behind for .remove() to find.
+	 */
+	hid_set_drvdata(hid, NULL);
 	kfree(pidff);
 	return error;
 }
